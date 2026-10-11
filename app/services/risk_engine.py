@@ -5,8 +5,8 @@ determines overall school risk level (GREEN / AMBER / RED),
 and finds the optimal 2-hour outdoor window.
 """
 
-from datetime import datetime
-from typing import List, Dict, Any, Tuple
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Tuple, Optional
 from app.models import (
     CPCBQualityBand,
     RiskLevel,
@@ -108,11 +108,15 @@ def format_window_label(dt_start: datetime, dt_end: datetime) -> str:
 def find_safe_window(
     hourly_times: List[str],
     hourly_pm25: List[float],
-    hourly_temp: List[float]
+    hourly_temp: List[float],
+    current_time: Optional[datetime] = None
 ) -> Tuple[SafeWindow, List[int]]:
     """
     Finds the optimal 2-hour continuous window in the next 48 hours.
-    Prioritizes daylight / school hours (07:00 to 17:00).
+    Rule 1: Only consider hours >= the current hour in local time. Never return a window that has started or passed.
+    Rule 2: Exactly 2 consecutive hours. Display start to start+2h (e.g. 10:00 AM - 12:00 PM).
+            Use end time in display_label, avg across the 2 hours, and chart highlight ([idx, idx+1]).
+    Rule 3: Restrict candidates to school-usable daylight, 6:00 AM to 6:00 PM local. If none remain today, use tomorrow's.
     Returns (SafeWindow, [safe_hour_index1, safe_hour_index2]).
     """
     if not hourly_times or len(hourly_times) < 2:
@@ -126,20 +130,43 @@ def find_safe_window(
             recommendation="Default safe outdoor window"
         ), []
 
-    best_idx = 0
-    best_score = float("inf")
-    
-    # First pass: check school daytime hours (07:00 to 17:00)
-    daytime_candidates = []
+    # Parse all timestamps
+    dt_series: List[datetime] = []
+    for t_str in hourly_times:
+        try:
+            dt_series.append(datetime.fromisoformat(t_str))
+        except Exception:
+            dt_series.append(datetime.now())
+
+    # Determine reference current_time (local time of place)
+    if current_time is not None:
+        now = current_time
+    else:
+        sys_now = datetime.now()
+        # If sys_now falls within hourly_times range, use it
+        if dt_series[0] <= sys_now <= dt_series[-1]:
+            now = sys_now
+        elif sys_now.date() == dt_series[0].date():
+            now = sys_now
+        else:
+            now = dt_series[0]
+
+    if now.tzinfo is not None:
+        now = now.replace(tzinfo=None)
+
+    today_date = now.date()
+    tomorrow_date = today_date + timedelta(days=1)
+
+    today_candidates = []
+    tomorrow_candidates = []
+    future_candidates = []
     all_candidates = []
 
-    for i in range(len(hourly_times) - 1):
-        try:
-            dt1 = datetime.fromisoformat(hourly_times[i])
-            hour = dt1.hour
-        except Exception:
-            hour = 10
+    for i in range(len(dt_series) - 1):
+        dt_start = dt_series[i]
+        dt_end = dt_start + timedelta(hours=2)
 
+        # Rule 2: 2 consecutive hours
         p1 = hourly_pm25[i] if i < len(hourly_pm25) else 50.0
         p2 = hourly_pm25[i+1] if (i+1) < len(hourly_pm25) else 50.0
         avg_pm = (p1 + p2) / 2.0
@@ -148,32 +175,47 @@ def find_safe_window(
         t2 = hourly_temp[i+1] if (i+1) < len(hourly_temp) else 28.0
         avg_t = (t1 + t2) / 2.0
 
-        # Score function: PM2.5 + penalty for high heat (>32°C)
         heat_penalty = max(0.0, (avg_t - 32.0) * 3.0)
         score = avg_pm + heat_penalty
 
-        all_candidates.append((score, i, avg_pm, avg_t))
-        if 7 <= hour <= 16:
-            daytime_candidates.append((score, i, avg_pm, avg_t))
+        candidate_info = (score, i, avg_pm, avg_t, dt_start, dt_end)
+        all_candidates.append(candidate_info)
 
-    candidates = daytime_candidates if daytime_candidates else all_candidates
-    candidates.sort(key=lambda x: x[0])
-    
-    selected_score, sel_idx, sel_pm, sel_temp = candidates[0]
-    
-    try:
-        dt_start = datetime.fromisoformat(hourly_times[sel_idx])
-        dt_end = datetime.fromisoformat(hourly_times[sel_idx + 1])
-        display_label = format_window_label(dt_start, dt_end)
-        s_time = dt_start.strftime("%H:%M")
-        e_time = dt_end.strftime("%H:%M")
-    except Exception:
-        display_label = f"Hour {sel_idx}:00 - {sel_idx+2}:00"
-        s_time = f"{sel_idx}:00"
-        e_time = f"{sel_idx+2}:00"
+        # Rule 3: School-usable daylight, 6:00 AM to 6:00 PM local (starts >= 6:00, ends <= 18:00 on same day)
+        is_daylight = (6 <= dt_start.hour <= 16) and (dt_end.hour <= 18) and (dt_end.date() == dt_start.date())
+        if not is_daylight:
+            continue
+
+        # Rule 1: Hours >= current hour in local time, never already started or passed
+        if dt_start.date() == today_date:
+            if dt_start.hour >= now.hour and dt_start >= now:
+                today_candidates.append(candidate_info)
+        elif dt_start.date() == tomorrow_date:
+            tomorrow_candidates.append(candidate_info)
+        elif dt_start.date() > today_date and dt_start >= now:
+            future_candidates.append(candidate_info)
+
+    # Rule 3: If candidates remain today, use today's. If none remain today, use tomorrow's.
+    if today_candidates:
+        pool = today_candidates
+    elif tomorrow_candidates:
+        pool = tomorrow_candidates
+    elif future_candidates:
+        pool = future_candidates
+    else:
+        fallback = [c for c in all_candidates if c[4] >= now]
+        pool = fallback if fallback else all_candidates
+
+    pool.sort(key=lambda x: x[0])
+    selected_score, sel_idx, sel_pm, sel_temp, dt_start, dt_end = pool[0]
+
+    # Rule 2: Display start to start+2h (e.g. 10:00 AM - 12:00 PM). Use end time in display_label.
+    display_label = format_window_label(dt_start, dt_end)
+    s_time = dt_start.strftime("%H:%M")
+    e_time = dt_end.strftime("%H:%M")
 
     _, band = compute_cpcb_aqi(sel_pm)
-    
+
     if band in [CPCBQualityBand.GOOD, CPCBQualityBand.SATISFACTORY]:
         rec = f"Ideal for outdoor sports and free play (Avg PM2.5: {sel_pm:.1f} µg/m³)."
     elif band == CPCBQualityBand.MODERATE:
